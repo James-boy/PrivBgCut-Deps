@@ -1,0 +1,229 @@
+name: fetch-ort-dylibs
+
+# 只在 Actions 页面手动触发，一次跑通后极少需要再动。
+# 未来升级 ORT 版本时改 input 值（如 1.23.2 → 1.24.0）重跑即可。
+on:
+  workflow_dispatch:
+    inputs:
+      ort_version:
+        description: 'ONNX Runtime version (e.g. 1.23.2)'
+        type: string
+        required: true
+        default: '1.23.2'
+
+# 同一版本的两次触发会串行执行，避免重复上传 asset 时的竞态。
+# 不同版本互不影响（deps-ort-v1.23.2 与 deps-ort-v1.24.0 是独立 tag）。
+concurrency:
+  group: fetch-ort-dylibs-${{ inputs.ort_version }}
+  cancel-in-progress: false
+
+jobs:
+  build-dylibs:
+    # ubuntu-latest 是 1× 计费，公开仓库免费。
+    # 全流程约 3~5 分钟（主要是 apt-get 安装 llvm 占多数时间）。
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write   # softprops/action-gh-release 需要
+
+    steps:
+      # ── 安装 LLVM（提供 llvm-lipo，Ubuntu 上代替 macOS 的 lipo） ──
+      - name: Install LLVM (llvm-lipo)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends llvm
+
+          # 不同 Ubuntu/LLVM 版本的 llvm-lipo 命名可能带版本号后缀，
+          # 做个探测 + 软链接兜底，避免后续步骤因路径差异失败。
+          if command -v llvm-lipo >/dev/null 2>&1; then
+            LLVM_LIPO_BIN=$(command -v llvm-lipo)
+          else
+            FOUND=$(ls /usr/lib/llvm-*/bin/llvm-lipo 2>/dev/null | head -1 || true)
+            if [ -z "$FOUND" ]; then
+              echo "ERROR: llvm-lipo not found after installing llvm"; exit 1
+            fi
+            sudo ln -sf "$FOUND" /usr/local/bin/llvm-lipo
+            LLVM_LIPO_BIN=/usr/local/bin/llvm-lipo
+          fi
+
+          echo "LLVM_LIPO=$LLVM_LIPO_BIN" >> $GITHUB_ENV
+          "$LLVM_LIPO_BIN" --version || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # ── 下载两个单架构 wheel ─────────────────────────────
+      # pip 的多个 --platform 是"或"关系，任一满足即可下载。
+      # 列出 13_0 / 12_0 / 11_0 三个常见 macOS 最低版本标签，
+      # 兼容不同 onnxruntime 版本可能采用的不同标签。
+      - name: Download x86_64 wheel
+        env:
+          ORT_VERSION: ${{ inputs.ort_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ort_x86_64
+          python3 -m pip download "onnxruntime==${ORT_VERSION}" \
+            --platform macosx_13_0_x86_64 \
+            --platform macosx_12_0_x86_64 \
+            --platform macosx_11_0_x86_64 \
+            --python-version 3.10 \
+            --only-binary=:all: \
+            --no-deps \
+            --retries 3 \
+            -d ort_x86_64
+          ls -lh ort_x86_64/
+
+      - name: Download arm64 wheel
+        env:
+          ORT_VERSION: ${{ inputs.ort_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ort_arm64
+          python3 -m pip download "onnxruntime==${ORT_VERSION}" \
+            --platform macosx_13_0_arm64 \
+            --platform macosx_12_0_arm64 \
+            --platform macosx_11_0_arm64 \
+            --python-version 3.10 \
+            --only-binary=:all: \
+            --no-deps \
+            --retries 3 \
+            -d ort_arm64
+          ls -lh ort_arm64/
+
+      # ── 解压 wheel，抽取真实 dylib 文件 ───────────────────
+      # wheel 内 libonnxruntime.dylib 往往是符号链接，指向带版本号
+      # 的真实文件（libonnxruntime.1.23.2.dylib）。用 -type f 只匹配
+      # 真实文件，避免后续 lipo 处理符号链接时的兼容性问题。
+      - name: Extract dylibs from wheels
+        env:
+          ORT_VERSION: ${{ inputs.ort_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+
+          X86_WHEEL=$(ls ort_x86_64/*.whl | head -1)
+          echo "x86_64 wheel: $X86_WHEEL"
+          unzip -q "$X86_WHEEL" -d x86_64_extracted
+          X86_DYLIB=$(find x86_64_extracted -type f -name 'libonnxruntime*.dylib' | head -1)
+          test -n "$X86_DYLIB" || { echo "ERROR: x86_64 dylib not found in wheel"; exit 1; }
+          cp "$X86_DYLIB" "out/libonnxruntime-${ORT_VERSION}-x86_64.dylib"
+
+          ARM_WHEEL=$(ls ort_arm64/*.whl | head -1)
+          echo "arm64 wheel: $ARM_WHEEL"
+          unzip -q "$ARM_WHEEL" -d arm64_extracted
+          ARM_DYLIB=$(find arm64_extracted -type f -name 'libonnxruntime*.dylib' | head -1)
+          test -n "$ARM_DYLIB" || { echo "ERROR: arm64 dylib not found in wheel"; exit 1; }
+          cp "$ARM_DYLIB" "out/libonnxruntime-${ORT_VERSION}-arm64.dylib"
+
+          ls -lh out/
+
+      # ── 校验单架构 dylib 的架构正确 ────────────────────────
+      # 这一步在合并前拦截"下错 wheel"的情况（比如 arm64 标签错取到
+      # x86_64 wheel），比合并后才发现更容易定位问题。
+      - name: Verify single-arch dylibs
+        env:
+          ORT_VERSION: ${{ inputs.ort_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "--- x86_64 dylib ---"
+          $LLVM_LIPO -info "out/libonnxruntime-${ORT_VERSION}-x86_64.dylib"
+          $LLVM_LIPO -archs "out/libonnxruntime-${ORT_VERSION}-x86_64.dylib" | grep -qw x86_64 \
+            || { echo "ERROR: x86_64 dylib does not contain x86_64 arch"; exit 1; }
+
+          echo "--- arm64 dylib ---"
+          $LLVM_LIPO -info "out/libonnxruntime-${ORT_VERSION}-arm64.dylib"
+          $LLVM_LIPO -archs "out/libonnxruntime-${ORT_VERSION}-arm64.dylib" | grep -qw arm64 \
+            || { echo "ERROR: arm64 dylib does not contain arm64 arch"; exit 1; }
+
+      # ── 合并成 universal2 fat binary ───────────────────────
+      - name: Merge to universal2
+        env:
+          ORT_VERSION: ${{ inputs.ort_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          $LLVM_LIPO -create \
+            "out/libonnxruntime-${ORT_VERSION}-x86_64.dylib" \
+            "out/libonnxruntime-${ORT_VERSION}-arm64.dylib" \
+            -output "out/libonnxruntime-${ORT_VERSION}-universal2.dylib"
+
+          echo "--- universal2 dylib ---"
+          $LLVM_LIPO -info "out/libonnxruntime-${ORT_VERSION}-universal2.dylib"
+          ARCHS=$($LLVM_LIPO -archs "out/libonnxruntime-${ORT_VERSION}-universal2.dylib")
+          echo "Architectures: $ARCHS"
+          echo "$ARCHS" | grep -qw x86_64 || { echo "ERROR: universal2 missing x86_64"; exit 1; }
+          echo "$ARCHS" | grep -qw arm64  || { echo "ERROR: universal2 missing arm64"; exit 1; }
+
+          ls -lh out/
+
+      # ── 上传 artifact 作为短期备份（90 天）──────────────────
+      # 主要产物在 release 里（永久），artifact 用于本次跑完立即下载
+      # 验证，不必进入 Releases 页面。
+      - name: Upload artifacts (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ort-dylibs-${{ inputs.ort_version }}
+          path: out/*.dylib
+          retention-days: 90
+
+      # ── 发布到独立 Release tag（永久可下载） ────────────────
+      # tag 命名 deps-ort-v{version}，与 App 发布 tag（app-v*）
+      # 完全分离。make_latest: false 确保它不会成为本仓库的
+      # "latest release"——虽然本仓库不用于 App 下载，但保持
+      # 语义清晰，未来若本仓库也有其它类型发布不受干扰。
+      # 重复运行同一版本时，softprops v2 默认会替换同名 asset，
+      # 天然幂等，可安全重跑。
+      - name: Publish to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: deps-ort-v${{ inputs.ort_version }}
+          name: ONNX Runtime ${{ inputs.ort_version }} dylibs (macOS)
+          body: |
+            Prebuilt ONNX Runtime ${{ inputs.ort_version }} dynamic libraries for macOS,
+            in three architectures for use by PrivBgCut's macOS build.
+
+            | Asset | Use case |
+            |---|---|
+            | `libonnxruntime-${{ inputs.ort_version }}-x86_64.dylib` | Intel Mac only |
+            | `libonnxruntime-${{ inputs.ort_version }}-arm64.dylib` | Apple Silicon only |
+            | `libonnxruntime-${{ inputs.ort_version }}-universal2.dylib` | Universal (Intel + Apple Silicon) |
+
+            **Usage**: rename to `libonnxruntime.dylib` and place at
+            `src-tauri/libonnxruntime.dylib` before `tauri build`. This
+            file is picked up by `bundle.macOS.frameworks` in `tauri.conf.json`.
+
+            **Compatibility**: requires `ort` crate feature `api-23`
+            (ONNX Runtime 1.23.x C API). If you upgrade to a newer ORT
+            version, update the `ort` feature accordingly.
+
+            **Source**: official PyPI wheels
+            `onnxruntime==${{ inputs.ort_version }}` for
+            `macosx_13_0_x86_64` and `macosx_13_0_arm64`,
+            merged with `llvm-lipo`.
+          files: out/*.dylib
+          fail_on_unmatched_files: true
+          make_latest: false
+
+      # ── 步骤摘要（把结果 URL 直接呈现在 Actions 页面）─────
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "### ONNX Runtime ${{ inputs.ort_version }} dylibs" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Release page:" >> $GITHUB_STEP_SUMMARY
+          echo "https://github.com/${{ github.repository }}/releases/tag/deps-ort-v${{ inputs.ort_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Direct download (x86_64):" >> $GITHUB_STEP_SUMMARY
+          echo "\`https://github.com/${{ github.repository }}/releases/download/deps-ort-v${{ inputs.ort_version }}/libonnxruntime-${{ inputs.ort_version }}-x86_64.dylib\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Direct download (universal2):" >> $GITHUB_STEP_SUMMARY
+          echo "\`https://github.com/${{ github.repository }}/releases/download/deps-ort-v${{ inputs.ort_version }}/libonnxruntime-${{ inputs.ort_version }}-universal2.dylib\`" >> $GITHUB_STEP_SUMMARY
