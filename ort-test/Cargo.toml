@@ -13,8 +13,9 @@ edition = "2021"
 name = "ort_dylib_test"
 path = "src/main.rs"
 
+# PrivBgCut-Deps/ort-test/Cargo.toml
 [dependencies]
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-23"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-23"] }
 
 [profile.release]
 opt-level = 2
