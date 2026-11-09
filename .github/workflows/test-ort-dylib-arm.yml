@@ -1,16 +1,15 @@
 name: test-ort-dylib-arm
 
-# 独立验证任意来源的 arm64 libonnxruntime.dylib 是否能加载并推理。
-# 完全自包含：不依赖主仓 PrivBgCut，模型通过 URL 直接下载。
+# 验证 arm64 libonnxruntime.dylib（官方或自定义构建）能否加载并对真实图像推理。
+# 默认使用 ONNX Runtime v1.31.1 官方 arm64 动态库。
 on:
   workflow_dispatch:
     inputs:
       dylib_url:
-        description: 'arm64 libonnxruntime.dylib 下载 URL'
+        description: 'arm64 libonnxruntime.dylib 下载 URL（支持 .dylib 或 .tgz）'
         type: string
         required: true
-        # 注意：把这里换成你自己 release 里 arm64 产物的实际地址
-        default: "https://github.com/James-boy/PrivBgCut-Deps/releases/download/deps-ort-v1.23.2/libonnxruntime-1.23.2-arm64.dylib"
+        default: "https://github.com/microsoft/onnxruntime/releases/download/v1.31.1/onnxruntime-osx-arm64-1.31.1.tgz"
       u2netp_url:
         description: '（可选）u2netp.onnx URL'
         type: string
@@ -26,6 +25,11 @@ on:
         type: string
         required: false
         default: 'https://www.modelscope.cn/models/xiaoer123456/Heliosoph_u2net-onnx/resolve/master/ppmatting-hrnet-w18.onnx?view=false'
+      test_image_url:
+        description: '真实测试图片 URL（用于 Matting 模型，避免随机噪声导致全 0）'
+        type: string
+        required: true
+        default: 'https://bj.bcebos.com/paddlehub/fastdeploy/matting_input.jpg'
 
 concurrency:
   group: test-ort-dylib-arm
@@ -33,24 +37,18 @@ concurrency:
 
 jobs:
   test:
-    # macos-15 / macos-26 均为原生 arm64 runner。
-    # 如果某个标签在你的仓库不可用，二选一替换即可。
-    runs-on: macos-15
+    runs-on: macos-15   # 原生 arm64
     timeout-minutes: 40
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 防止标签意外映射到 x86_64 runner，导致“假 arm64”测试
       - name: Verify runner is arm64
         shell: bash
         run: |
           set -euo pipefail
-          uname -m
-          sw_vers
-          test "$(uname -m)" = "arm64" \
-            || { echo "ERROR: runner 不是 arm64，请检查 runs-on 标签"; exit 1; }
+          test "$(uname -m)" = "arm64" || { echo "ERROR: runner 不是 arm64"; exit 1; }
           echo "OK: native arm64 runner"
 
       - name: Setup Rust
@@ -60,9 +58,35 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ort-test
-          # 和 Intel 版分开，避免缓存串味
           key: ort-dylib-test-arm
           cache-targets: true
+
+      # ── 下载 dylib（兼容 .tgz 和裸 .dylib）───────────────
+      - name: Download dylib
+        shell: bash
+        env:
+          DYLIB_URL: ${{ inputs.dylib_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p ort-test-dylib
+          if [[ "$DYLIB_URL" == *.tgz ]] || [[ "$DYLIB_URL" == *.tar.gz ]]; then
+            echo "Detected tarball, downloading and extracting..."
+            curl -fL --retry 3 --retry-delay 2 -o /tmp/ort.tgz "$DYLIB_URL"
+            tar -xzf /tmp/ort.tgz -C /tmp
+            DYLIB_PATH=$(find /tmp -name 'libonnxruntime.dylib' -type f | head -1)
+            test -n "$DYLIB_PATH" || { echo "ERROR: tgz 中未找到 libonnxruntime.dylib"; exit 1; }
+            cp "$DYLIB_PATH" ort-test-dylib/libonnxruntime.dylib
+          else
+            curl -fL --retry 3 --retry-delay 2 -o ort-test-dylib/libonnxruntime.dylib "$DYLIB_URL"
+          fi
+          ls -lh ort-test-dylib/libonnxruntime.dylib
+          file ort-test-dylib/libonnxruntime.dylib
+          lipo -info ort-test-dylib/libonnxruntime.dylib
+          ARCHS=$(lipo -archs ort-test-dylib/libonnxruntime.dylib)
+          echo "$ARCHS" | grep -qw arm64 || { echo "ERROR: dylib 不含 arm64 slice"; exit 1; }
+          nm -gU ort-test-dylib/libonnxruntime.dylib | grep -q OrtGetApiBase \
+            || { echo "ERROR: 缺少 OrtGetApiBase 符号"; exit 1; }
+          echo "OK: OrtGetApiBase present"
 
       # ── 下载模型 ────────────────────────────────────────────
       - name: Download u2netp
@@ -73,7 +97,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p models
-          echo "Downloading u2netp from: $URL"
           curl -fL --retry 3 --retry-delay 2 -o models/u2netp.onnx "$URL"
           ls -lh models/u2netp.onnx
 
@@ -85,7 +108,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p models
-          echo "Downloading birefnet from: $URL"
           curl -fL --retry 3 --retry-delay 2 -o models/birefnet-lite-dynamic.onnx "$URL"
           ls -lh models/birefnet-lite-dynamic.onnx
 
@@ -97,7 +119,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p models
-          echo "Downloading ppmatting from: $URL"
           curl -fL --retry 3 --retry-delay 2 -o models/ppmatting-hrnet-w18.onnx "$URL"
           ls -lh models/ppmatting-hrnet-w18.onnx
 
@@ -107,73 +128,52 @@ jobs:
           set -euo pipefail
           COUNT=0
           for f in models/u2netp.onnx models/birefnet-lite-dynamic.onnx models/ppmatting-hrnet-w18.onnx; do
-            if [ -f "$f" ]; then
-              echo "OK: $f ($(du -h "$f" | cut -f1))"
-              COUNT=$((COUNT + 1))
-            fi
+            if [ -f "$f" ]; then echo "OK: $f ($(du -h "$f" | cut -f1))"; COUNT=$((COUNT + 1)); fi
           done
-          if [ "$COUNT" -eq 0 ]; then
-            echo "ERROR: 一个模型都没下载到，检查 URL 输入"
-            exit 1
-          fi
+          test "$COUNT" -gt 0 || { echo "ERROR: 一个模型都没下载到"; exit 1; }
           echo "共 $COUNT 个模型待测"
 
-      # ── 下载待测 dylib ─────────────────────────────────────
-      - name: Download dylib
+      # ── 下载真实测试图片 ───────────────────────────────────
+      - name: Download test image
         shell: bash
         env:
-          DYLIB_URL: ${{ inputs.dylib_url }}
+          URL: ${{ inputs.test_image_url }}
         run: |
           set -euo pipefail
-          mkdir -p ort-test-dylib
-          curl -fL --retry 3 --retry-delay 2 \
-            -o ort-test-dylib/libonnxruntime.dylib \
-            "$DYLIB_URL"
-          ls -lh ort-test-dylib/libonnxruntime.dylib
-          echo "--- file ---"
-          file ort-test-dylib/libonnxruntime.dylib
-          echo "--- architecture ---"
-          lipo -info ort-test-dylib/libonnxruntime.dylib
-          ARCHS=$(lipo -archs ort-test-dylib/libonnxruntime.dylib)
-          echo "Architectures: $ARCHS"
-          echo "$ARCHS" | grep -qw arm64 \
-            || { echo "ERROR: dylib 不含 arm64 slice"; exit 1; }
-          echo "--- linked libs ---"
-          otool -L ort-test-dylib/libonnxruntime.dylib
-          nm -gU ort-test-dylib/libonnxruntime.dylib | grep -q OrtGetApiBase \
-            || { echo "ERROR: 缺少 OrtGetApiBase 符号"; exit 1; }
-          echo "OK: OrtGetApiBase present"
+          mkdir -p testdata
+          curl -fL --retry 3 --retry-delay 2 -o testdata/input.jpg "$URL"
+          ls -lh testdata/input.jpg
+          file testdata/input.jpg
 
-      # ── 编译测试二进制（arm64 原生）────────────────────────
+      # ── 编译测试二进制 ─────────────────────────────────────
       - name: Build test binary
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release \
-            --manifest-path ort-test/Cargo.toml
+          cargo build --release --manifest-path ort-test/Cargo.toml
           TEST_BIN="ort-test/target/release/ort_dylib_test"
           test -x "$TEST_BIN" || { echo "ERROR: 测试二进制缺失"; exit 1; }
-          echo "--- test binary arch ---"
           lipo -info "$TEST_BIN"
-          lipo -archs "$TEST_BIN" | grep -qw arm64 \
-            || { echo "ERROR: 测试二进制不是 arm64"; exit 1; }
+          lipo -archs "$TEST_BIN" | grep -qw arm64 || { echo "ERROR: 测试二进制不是 arm64"; exit 1; }
           echo "TEST_BIN=$TEST_BIN" >> $GITHUB_ENV
 
       # ── 运行测试 ───────────────────────────────────────────
+      # 测试程序需支持 TEST_IMAGE_PATH 环境变量：
+      #   若存在，则用该图片做真实输入；否则退回伪随机输入。
       - name: Run dylib + model inference test
         shell: bash
         env:
           ORT_DYLIB_PATH: ${{ github.workspace }}/ort-test-dylib/libonnxruntime.dylib
+          TEST_IMAGE_PATH: ${{ github.workspace }}/testdata/input.jpg
         run: |
           set -euo pipefail
           MODEL_ARGS=""
           for m in u2netp.onnx birefnet-lite-dynamic.onnx ppmatting-hrnet-w18.onnx; do
-            if [ -f "models/$m" ]; then
-              MODEL_ARGS="$MODEL_ARGS models/$m"
-            fi
+            if [ -f "models/$m" ]; then MODEL_ARGS="$MODEL_ARGS models/$m"; fi
           done
-          echo "测试模型列表: $MODEL_ARGS"
-          echo "使用 dylib: $ORT_DYLIB_PATH"
+          echo "测试模型: $MODEL_ARGS"
+          echo "测试图片: $TEST_IMAGE_PATH"
+          echo "dylib: $ORT_DYLIB_PATH"
           # shellcheck disable=SC2086
           "$TEST_BIN" $MODEL_ARGS
 
@@ -182,12 +182,13 @@ jobs:
         shell: bash
         run: |
           {
-            echo "### ORT dylib test (arm64)"
+            echo "### ORT dylib test (arm64, official v1.31.1)"
             echo ""
             echo "- dylib_url: \`${{ inputs.dylib_url }}\`"
-            echo "- u2netp_url: \`${{ inputs.u2netp_url }}\`"
-            echo "- birefnet_url: \`${{ inputs.birefnet_url }}\`"
-            echo "- ppmatting_url: \`${{ inputs.ppmatting_url }}\`"
-            echo "- runner: macos-15 (arm64 native)"
-            echo "- uname -m: \`$(uname -m)\`"
+            echo "- test_image_url: \`${{ inputs.test_image_url }}\`"
+            echo "- runner: \`$(uname -m)\` on macOS $(sw_vers -productVersion)"
+            echo ""
+            echo "预期结果："
+            echo "- u2netp / ppmatting 在真实图片输入下应 PASS"
+            echo "- birefnet 在官方 dylib 下仍可能因 DeformConv 失败（预期，非本 workflow 缺陷）"
           } >> $GITHUB_STEP_SUMMARY
