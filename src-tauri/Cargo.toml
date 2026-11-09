@@ -4,3 +4,10 @@
 name = "ort_dylib_test"
 path = "src/bin/ort_dylib_test.rs"
 required-features = ["dylib-test"]
+
+# src-tauri/Cargo.toml — 在已有 [features] 区块内追加
+
+[features]
+default = []
+smoke-test = []
+dylib-test = []   # ← 新增
