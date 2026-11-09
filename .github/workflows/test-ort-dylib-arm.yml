@@ -61,6 +61,16 @@ jobs:
           key: ort-dylib-test-arm
           cache-targets: true
 
+      # ── 自动补上 image 解码依赖（避免手动改 Cargo.toml）───
+      - name: Add image dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo add image \
+            --manifest-path ort-test/Cargo.toml \
+            --no-default-features \
+            --features jpeg,png
+
       # ── 下载 dylib（兼容 .tgz 和裸 .dylib）───────────────
       - name: Download dylib
         shell: bash
@@ -158,8 +168,6 @@ jobs:
           echo "TEST_BIN=$TEST_BIN" >> $GITHUB_ENV
 
       # ── 运行测试 ───────────────────────────────────────────
-      # 测试程序需支持 TEST_IMAGE_PATH 环境变量：
-      #   若存在，则用该图片做真实输入；否则退回伪随机输入。
       - name: Run dylib + model inference test
         shell: bash
         env:
