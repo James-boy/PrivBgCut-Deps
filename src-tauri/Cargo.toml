@@ -1,0 +1,6 @@
+# src-tauri/Cargo.toml — 在已有 [[bin]] ort_smoke_test 下方追加
+
+[[bin]]
+name = "ort_dylib_test"
+path = "src/bin/ort_dylib_test.rs"
+required-features = ["dylib-test"]
