@@ -14,7 +14,7 @@ on:
         description: '（可选）u2netp.onnx URL'
         type: string
         required: false
-        default: ''
+        default: 'https://www.modelscope.cn/models/xiaoer123456/Heliosoph_u2net-onnx/resolve/master/u2netp.onnx?view=false'
       birefnet_url:
         description: '（可选）birefnet-lite-dynamic.onnx URL'
         type: string
@@ -24,7 +24,7 @@ on:
         description: '（可选）ppmatting-hrnet-w18.onnx URL'
         type: string
         required: false
-        default: ''
+        default: 'https://www.modelscope.cn/models/xiaoer123456/Heliosoph_u2net-onnx/resolve/master/ppmatting-hrnet-w18.onnx?view=false'
 
 concurrency:
   group: test-ort-dylib
