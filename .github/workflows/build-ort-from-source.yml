@@ -1,0 +1,100 @@
+name: build-ort-from-source
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: build-ort-from-source
+  cancel-in-progress: true
+
+jobs:
+  build-x86_64-dylib:
+    # 直接使用 Intel 架构的 macOS runner，避免交叉编译的复杂性和不确定性
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout ONNX Runtime source at specific commit
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/onnxruntime
+          # ⚠️ 关键：必须使用 PR 最后一个 commit 的 40 位 SHA
+          ref: 17b155acd8e996e4fd8e86fd48020505807bf6ea
+          # 必须获取完整历史，因为构建脚本需要查询版本信息
+          fetch-depth: 0
+          # 递归检出所有子模块（如 cutlass, eigen 等）
+          submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 安装 CMake 等基础工具
+          brew install cmake ninja || true
+          # 检查 Xcode 版本
+          xcodebuild -version
+
+      - name: Build ONNX Runtime (x86_64, shared lib)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --osx_arch x86_64 强制编译 Intel 版本
+          # --use_xcode 使用 Xcode 工具链，对 x86_64 macOS 构建是必要的
+          # --build_shared_lib 生成 .dylib
+          # --skip_tests 跳过测试以节省时间
+          python3 tools/ci_build/build.py \
+            --build_dir build/macos_x86_64 \
+            --config Release \
+            --build_shared_lib \
+            --osx_arch x86_64 \
+            --use_xcode \
+            --skip_tests \
+            --parallel \
+            --update --build
+
+      - name: Locate and verify the built dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          # build.py 的输出路径可能有嵌套，用 find 定位
+          DYLIB_PATH=$(find build/macos_x86_64 -name "libonnxruntime.dylib" -type f | head -1)
+          if [ -z "$DYLIB_PATH" ]; then
+            echo "ERROR: libonnxruntime.dylib not found"
+            find build/macos_x86_64 -name "*.dylib" | head -20
+            exit 1
+          fi
+          echo "Found dylib at: $DYLIB_PATH"
+          lipo -info "$DYLIB_PATH"
+          # 确认架构确实是 x86_64
+          lipo -archs "$DYLIB_PATH" | grep -qw x86_64 || { echo "ERROR: not x86_64"; exit 1; }
+          # 复制到工作区根目录，方便上传
+          cp "$DYLIB_PATH" ./libonnxruntime-from-src.dylib
+
+      - name: Upload artifact (for immediate download)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ort-dylib-from-src-x86_64
+          path: libonnxruntime-from-src.dylib
+          retention-days: 7
+
+      # 可选：发布到独立的 Release tag，便于长期引用
+      - name: Publish to release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: deps-ort-from-src-${{ github.run_id }}
+          name: ONNX Runtime from source (PR #27393) - x86_64
+          body: |
+            Custom build of ONNX Runtime from PR #27393,
+            containing DeformConv CPU/CUDA support.
+            Built for macOS x86_64.
+          files: libonnxruntime-from-src.dylib
+          fail_on_unmatched_files: true
+          make_latest: false
