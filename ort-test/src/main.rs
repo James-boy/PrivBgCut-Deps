@@ -3,12 +3,18 @@
 // 独立测试程序：验证某个 libonnxruntime.dylib 是否能加载，
 // 是否能对指定 ONNX 模型跑推理，输出是否合理。
 //
+// 输入优先级：
+//   1. 若设置了 TEST_IMAGE_PATH 且文件存在，则用真实图片（resize + ImageNet 归一化）
+//   2. 否则使用确定性伪随机输入（保证可复现，且不引入 rand 依赖）
+//
 // 用法：
 //   ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib \
+//   TEST_IMAGE_PATH=/path/to/input.jpg \
 //     ./ort_dylib_test model1.onnx model2.onnx ...
 
 use std::path::Path;
 
+use image::GenericImageView;
 use ort::session::Session;
 use ort::value::Tensor;
 
@@ -75,25 +81,55 @@ fn test_model(model_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("模型文件不存在: {}", model_path).into());
     }
 
-    // 按文件名推测输入尺寸（不需要完整 ModelSpec，测试够用即可）
+    // 按文件名推测输入尺寸（测试够用即可）
     let side: u32 = if model_path.contains("u2netp") {
         320
-    } else if model_path.contains("ppmatting") {
-        512
     } else {
         512
     };
     println!("[test] 方形输入尺寸: {}x{}", side, side);
 
-    // 构造确定性伪随机输入（不引入 rand 依赖）
-    let mut pixels = vec![0u8; (side * side * 3) as usize];
-    for y in 0..side {
-        for x in 0..side {
-            let idx = ((y * side + x) * 3) as usize;
-            pixels[idx] = ((x * 7 + y * 13) & 0xff) as u8;
-            pixels[idx + 1] = ((x * 31 + y * 17) & 0xff) as u8;
-            pixels[idx + 2] = ((x * 3 + y * 29) & 0xff) as u8;
+    // ── 构造输入像素（真实图片优先，失败回退随机）────────────
+    let mut pixels: Vec<u8> = Vec::new();
+    let mut used_real_image = false;
+
+    if let Ok(img_path) = std::env::var("TEST_IMAGE_PATH") {
+        if Path::new(&img_path).exists() {
+            println!("[test] 尝试加载真实测试图片: {}", img_path);
+            match image::open(&img_path) {
+                Ok(img) => {
+                    let resized =
+                        img.resize_exact(side, side, image::imageops::FilterType::Triangle);
+                    let rgb = resized.to_rgb8();
+                    pixels = rgb.into_raw();
+                    used_real_image = true;
+                    println!("[test] 真实图片加载成功，尺寸: {:?}", resized.dimensions());
+                }
+                Err(e) => {
+                    println!("[test] 图片加载失败: {}，回退到伪随机输入", e);
+                }
+            }
+        } else {
+            println!(
+                "[test] TEST_IMAGE_PATH 指向的文件不存在: {}，回退到伪随机输入",
+                img_path
+            );
         }
+    } else {
+        println!("[test] 未设置 TEST_IMAGE_PATH，使用伪随机输入");
+    }
+
+    if !used_real_image {
+        pixels = vec![0u8; (side * side * 3) as usize];
+        for y in 0..side {
+            for x in 0..side {
+                let idx = ((y * side + x) * 3) as usize;
+                pixels[idx] = ((x * 7 + y * 13) & 0xff) as u8;
+                pixels[idx + 1] = ((x * 31 + y * 17) & 0xff) as u8;
+                pixels[idx + 2] = ((x * 3 + y * 29) & 0xff) as u8;
+            }
+        }
+        println!("[test] 已生成 {}x{} 确定性伪随机输入", side, side);
     }
 
     // ImageNet 归一化（u2netp / birefnet 通用；归一化差异不影响加载验证）
