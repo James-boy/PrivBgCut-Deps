@@ -1,0 +1,21 @@
+# PrivBgCut-Deps/ort-test/Cargo.toml
+# 完全独立的测试 crate，不依赖主仓 PrivBgCut。
+# 空 [workspace] 声明切断与上层任何 workspace 的继承关系。
+
+[workspace]
+
+[package]
+name = "ort-dylib-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ort_dylib_test"
+path = "src/main.rs"
+
+[dependencies]
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-23"] }
+
+[profile.release]
+opt-level = 2
+strip = true
