@@ -9,10 +9,11 @@ name: test-ort-dylib
 on:
   workflow_dispatch:
     inputs:
-      dylib_url: 'https://github.com/James-boy/PrivBgCut-Deps/releases/download/deps-ort-v1.23.2/libonnxruntime-1.23.2-x86_64.dylib'
+      dylib_url: 
         description: 'libonnxruntime.dylib 下载 URL'
         type: string
         required: true
+        default: "https://github.com/James-boy/PrivBgCut-Deps/releases/download/deps-ort-v1.23.2/libonnxruntime-1.23.2-x86_64.dylib"
       u2netp_url:
         description: '（可选）u2netp.onnx 下载 URL，留空则跳过'
         type: string
