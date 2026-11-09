@@ -9,22 +9,20 @@ concurrency:
 
 jobs:
   build-x86_64-dylib:
-    # 直接使用 Intel 架构的 macOS runner，避免交叉编译的复杂性和不确定性
+    # 180 分钟足够覆盖首次冷编译 + 保底超时止损
     runs-on: macos-15-intel
-    timeout-minutes: 120
+    timeout-minutes: 180
     permissions:
       contents: write
 
     steps:
-      - name: Checkout ONNX Runtime source at specific commit
+      - name: Checkout ONNX Runtime source at PR #27393
         uses: actions/checkout@v4
         with:
           repository: microsoft/onnxruntime
-          # ⚠️ 关键：必须使用 PR 最后一个 commit 的 40 位 SHA
+          # ⚠️ 必须填 PR 最后一个 commit 的 40 位 SHA
           ref: 17b155acd8e996e4fd8e86fd48020505807bf6ea
-          # 必须获取完整历史，因为构建脚本需要查询版本信息
           fetch-depth: 0
-          # 递归检出所有子模块（如 cutlass, eigen 等）
           submodules: recursive
 
       - name: Setup Python
@@ -36,19 +34,38 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # 安装 CMake 等基础工具
-          brew install cmake ninja || true
-          # 检查 Xcode 版本
+          brew install cmake ninja ccache || true
           xcodebuild -version
+          echo "--- CPU cores ---"
+          sysctl -n hw.ncpu
+          ccache --version
+
+      # ── ccache：post 阶段自动保存，job 失败也保存 ─────────
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ccache-ort-x86_64-${{ github.sha }}
+          max-size: 2G
+          verbose: 1
+
+      # ── ORT build 目录缓存：分离 restore/save 以支持失败时保存 ──
+      - name: Restore ORT build cache
+        id: ort-build-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: build/macos_x86_64
+          key: ort-build-x86_64-${{ github.sha }}
+          restore-keys: |
+            ort-build-x86_64-
 
       - name: Build ONNX Runtime (x86_64, shared lib)
         shell: bash
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 2G
         run: |
           set -euo pipefail
-          # --osx_arch x86_64 强制编译 Intel 版本
-          # --use_xcode 使用 Xcode 工具链，对 x86_64 macOS 构建是必要的
-          # --build_shared_lib 生成 .dylib
-          # --skip_tests 跳过测试以节省时间
+          # 显式让 CMake 使用 ccache 作为编译器启动器，避免 build.py 检测不到
           python3 tools/ci_build/build.py \
             --build_dir build/macos_x86_64 \
             --config Release \
@@ -57,44 +74,93 @@ jobs:
             --use_xcode \
             --skip_tests \
             --parallel \
+            --cmake_extra_defines \
+              CMAKE_C_COMPILER_LAUNCHER=ccache \
+              CMAKE_CXX_COMPILER_LAUNCHER=ccache \
             --update --build
 
+      # ── 保存 build 目录缓存：即使后续失败也保存 ──────────
+      - name: Save ORT build cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: build/macos_x86_64
+          key: ort-build-x86_64-${{ github.sha }}
+
+      # ── 定位并复制 dylib：修复 -type f 漏符号链接的 bug ──────
       - name: Locate and verify the built dylib
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
-          # build.py 的输出路径可能有嵌套，用 find 定位
-          DYLIB_PATH=$(find build/macos_x86_64 -name "libonnxruntime.dylib" -type f | head -1)
+          # 允许普通文件和符号链接
+          DYLIB_PATH=$(find build/macos_x86_64 -name "libonnxruntime.dylib" \( -type f -o -type l \) | head -1)
           if [ -z "$DYLIB_PATH" ]; then
-            echo "ERROR: libonnxruntime.dylib not found"
-            find build/macos_x86_64 -name "*.dylib" | head -20
+            echo "ERROR: libonnxruntime.dylib not found in build/macos_x86_64"
+            echo "--- all dylibs present ---"
+            find build/macos_x86_64 -name "*.dylib" | head -30
             exit 1
           fi
           echo "Found dylib at: $DYLIB_PATH"
+          echo "--- real target of symlink ---"
+          readlink -f "$DYLIB_PATH" || true
+          echo "--- lipo info ---"
           lipo -info "$DYLIB_PATH"
-          # 确认架构确实是 x86_64
-          lipo -archs "$DYLIB_PATH" | grep -qw x86_64 || { echo "ERROR: not x86_64"; exit 1; }
-          # 复制到工作区根目录，方便上传
-          cp "$DYLIB_PATH" ./libonnxruntime-from-src.dylib
+          ARCHS=$(lipo -archs "$DYLIB_PATH")
+          echo "Architectures: $ARCHS"
+          echo "$ARCHS" | grep -qw x86_64 || { echo "ERROR: not x86_64"; exit 1; }
+          # 复制真实文件（解引用符号链接），确保上传的实体是可用的
+          cp -L "$DYLIB_PATH" ./libonnxruntime-from-src.dylib
+          ls -lh ./libonnxruntime-from-src.dylib
+          echo "--- confirm OrtGetApiBase symbol ---"
+          nm -gU ./libonnxruntime-from-src.dylib | grep -q OrtGetApiBase \
+            || { echo "ERROR: OrtGetApiBase missing"; exit 1; }
+          echo "OK: OrtGetApiBase present"
 
-      - name: Upload artifact (for immediate download)
+      # ── 上传 artifact：即使后续失败也能拿到产物 ──────────
+      - name: Upload artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ort-dylib-from-src-x86_64
+          name: ort-dylib-from-src-x86_64-${{ github.run_id }}
           path: libonnxruntime-from-src.dylib
           retention-days: 7
+          if-no-files-found: warn
 
-      # 可选：发布到独立的 Release tag，便于长期引用
+      # ── 发布到 Release：仅在成功时 ────────────────────────
       - name: Publish to release
-        if: github.event_name == 'workflow_dispatch'
+        if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: deps-ort-from-src-${{ github.run_id }}
           name: ONNX Runtime from source (PR #27393) - x86_64
           body: |
-            Custom build of ONNX Runtime from PR #27393,
-            containing DeformConv CPU/CUDA support.
-            Built for macOS x86_64.
+            Custom build of ONNX Runtime from PR #27393 (DeformConv CPU/CUDA support).
+            Built on macos-15-intel for macOS x86_64.
+
+            **Usage**: rename to `libonnxruntime.dylib` and pass to
+            `test-ort-dylib.yml` via `dylib_url`.
           files: libonnxruntime-from-src.dylib
           fail_on_unmatched_files: true
           make_latest: false
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### ORT from-source build"
+            echo ""
+            echo "- runner: macos-15-intel"
+            echo "- ccache: enabled"
+            echo "- build cache: restore/save 分离"
+            echo ""
+            if [ -f libonnxruntime-from-src.dylib ]; then
+              echo "**产物已生成**"
+              echo ""
+              ls -lh libonnxruntime-from-src.dylib
+              lipo -info libonnxruntime-from-src.dylib
+            else
+              echo "**产物缺失**（检查 build 步骤日志）"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
