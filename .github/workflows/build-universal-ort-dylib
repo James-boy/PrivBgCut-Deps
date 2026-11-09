@@ -1,0 +1,499 @@
+name: build-universal-ort-dylib
+
+# 流程：
+#   1. test-arm64  : 在原生 arm64 runner 上测试 arm64 dylib
+#   2. test-intel  : 在原生 x86_64 runner 上测试 x86_64 dylib
+#   3. merge       : 两者通过后 lipo 合并为 universal
+#   4. verify-universal: universal 分别在 arm64 / x86_64 runner 上原生复验
+#   5. release     : 全部通过后发布三个 dylib（arm64 / x86_64 / universal）
+
+on:
+  workflow_dispatch:
+    inputs:
+      arm_dylib_url:
+        description: 'arm64 dylib 来源（支持 .dylib 或 .tgz）'
+        type: string
+        required: true
+        default: 'https://github.com/microsoft/onnxruntime/releases/download/v1.31.1/onnxruntime-osx-arm64-1.31.1.tgz'
+      intel_dylib_url:
+        description: 'x86_64 dylib 来源（支持 .dylib 或 .tgz）'
+        type: string
+        required: true
+        default: 'https://github.com/James-boy/PrivBgCut-Deps/releases/download/deps-ort-from-src-42585509962/libonnxruntime-from-src.dylib'
+      release_tag:
+        description: '发布 tag（留空则自动生成 deps-ort-universal-<run_id>）'
+        type: string
+        required: false
+        default: ''
+      u2netp_url:
+        description: '（可选）u2netp.onnx URL'
+        type: string
+        required: false
+        default: 'https://www.modelscope.cn/models/xiaoer123456/Heliosoph_u2net-onnx/resolve/master/u2netp.onnx?view=false'
+      birefnet_url:
+        description: '（可选）birefnet-lite-dynamic.onnx URL（留空跳过）'
+        type: string
+        required: false
+        default: 'https://hf-mirror.com/senty-au/BiRefNet_lite-ONNX-dynamic/resolve/main/onnx/model.onnx?download=true'
+      ppmatting_url:
+        description: '（可选）ppmatting-hrnet-w18.onnx URL（留空跳过）'
+        type: string
+        required: false
+        default: 'https://www.modelscope.cn/models/xiaoer123456/Heliosoph_u2net-onnx/resolve/master/ppmatting-hrnet-w18.onnx?view=false'
+      test_image_url:
+        description: '真实测试图片 URL'
+        type: string
+        required: true
+        default: 'https://bj.bcebos.com/paddlehub/fastdeploy/matting_input.jpg'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-universal-ort-dylib
+  cancel-in-progress: false
+
+# ════════════════════════════════════════════════════════════
+jobs:
+  # ── 1. ARM64 原生测试 ─────────────────────────────────────
+  test-arm64:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify runner is arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64" || { echo "ERROR: runner 不是 arm64"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ort-test
+          key: ort-dylib-test-arm64
+          cache-targets: true
+
+      - name: Add image dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo add image --manifest-path ort-test/Cargo.toml \
+            --no-default-features --features jpeg,png
+
+      - name: Download arm64 dylib
+        shell: bash
+        env:
+          DYLIB_URL: ${{ inputs.arm_dylib_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p ort-test-dylib
+          if [[ "$DYLIB_URL" == *.tgz ]] || [[ "$DYLIB_URL" == *.tar.gz ]]; then
+            curl -fL --retry 3 --retry-delay 2 -o /tmp/ort.tgz "$DYLIB_URL"
+            rm -rf /tmp/ort-extract && mkdir -p /tmp/ort-extract
+            tar -xzf /tmp/ort.tgz -C /tmp/ort-extract
+            find /tmp/ort-extract -maxdepth 3 \( -type f -o -type l \) | head -50
+            DYLIB_PATH=""
+            if [ -e /tmp/ort-extract/lib/libonnxruntime.dylib ]; then
+              DYLIB_PATH=/tmp/ort-extract/lib/libonnxruntime.dylib
+            else
+              DYLIB_PATH=$(find /tmp/ort-extract -type f -name 'libonnxruntime.dylib' | head -1)
+            fi
+            [ -n "$DYLIB_PATH" ] || DYLIB_PATH=$(find /tmp/ort-extract -type f -name 'libonnxruntime*.dylib' | head -1)
+            [ -n "$DYLIB_PATH" ] || { echo "ERROR: 未找到 libonnxruntime*.dylib"; find /tmp/ort-extract \( -type f -o -type l \); exit 1; }
+            cp -L "$DYLIB_PATH" ort-test-dylib/libonnxruntime.dylib
+          else
+            curl -fL --retry 3 --retry-delay 2 -o ort-test-dylib/libonnxruntime.dylib "$DYLIB_URL"
+          fi
+          file ort-test-dylib/libonnxruntime.dylib
+          lipo -info ort-test-dylib/libonnxruntime.dylib
+          lipo -archs ort-test-dylib/libonnxruntime.dylib | grep -qw arm64 \
+            || { echo "ERROR: 不是 arm64"; exit 1; }
+          nm -gU ort-test-dylib/libonnxruntime.dylib | grep -q OrtGetApiBase \
+            || { echo "ERROR: 缺 OrtGetApiBase"; exit 1; }
+
+      - name: Download models
+        shell: bash
+        env:
+          U2NETP_URL: ${{ inputs.u2netp_url }}
+          BIREFNET_URL: ${{ inputs.birefnet_url }}
+          PPMATTING_URL: ${{ inputs.ppmatting_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p models
+          [ -n "$U2NETP_URL" ]  && curl -fL --retry 3 -o models/u2netp.onnx "$U2NETP_URL"
+          [ -n "$BIREFNET_URL" ] && curl -fL --retry 3 -o models/birefnet-lite-dynamic.onnx "$BIREFNET_URL"
+          [ -n "$PPMATTING_URL" ] && curl -fL --retry 3 -o models/ppmatting-hrnet-w18.onnx "$PPMATTING_URL"
+          ls -lh models/ || true
+          ls models/*.onnx >/dev/null 2>&1 || { echo "ERROR: 一个模型都没下载到"; exit 1; }
+
+      - name: Download test image
+        shell: bash
+        env:
+          URL: ${{ inputs.test_image_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p testdata
+          curl -fL --retry 3 -o testdata/input.jpg "$URL"
+          file testdata/input.jpg
+
+      - name: Build test binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path ort-test/Cargo.toml
+          TEST_BIN="ort-test/target/release/ort_dylib_test"
+          test -x "$TEST_BIN"
+          lipo -archs "$TEST_BIN" | grep -qw arm64 || { echo "ERROR: 测试二进制不是 arm64"; exit 1; }
+          echo "TEST_BIN=$TEST_BIN" >> $GITHUB_ENV
+
+      - name: Run test
+        shell: bash
+        env:
+          ORT_DYLIB_PATH: ${{ github.workspace }}/ort-test-dylib/libonnxruntime.dylib
+          TEST_IMAGE_PATH: ${{ github.workspace }}/testdata/input.jpg
+        run: |
+          set -euo pipefail
+          MODEL_ARGS=""
+          for m in u2netp.onnx birefnet-lite-dynamic.onnx ppmatting-hrnet-w18.onnx; do
+            [ -f "models/$m" ] && MODEL_ARGS="$MODEL_ARGS models/$m"
+          done
+          # shellcheck disable=SC2086
+          "$TEST_BIN" $MODEL_ARGS
+
+      - name: Upload arm64 dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: dylib-arm64
+          path: ort-test-dylib/libonnxruntime.dylib
+          if-no-files-found: error
+
+  # ── 2. x86_64 原生测试 ────────────────────────────────────
+  test-intel:
+    runs-on: macos-15-intel
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify runner is x86_64
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "x86_64" || { echo "ERROR: runner 不是 x86_64"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ort-test
+          key: ort-dylib-test-x86_64
+          cache-targets: true
+
+      - name: Add image dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo add image --manifest-path ort-test/Cargo.toml \
+            --no-default-features --features jpeg,png
+
+      - name: Download x86_64 dylib
+        shell: bash
+        env:
+          DYLIB_URL: ${{ inputs.intel_dylib_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p ort-test-dylib
+          if [[ "$DYLIB_URL" == *.tgz ]] || [[ "$DYLIB_URL" == *.tar.gz ]]; then
+            curl -fL --retry 3 --retry-delay 2 -o /tmp/ort.tgz "$DYLIB_URL"
+            rm -rf /tmp/ort-extract && mkdir -p /tmp/ort-extract
+            tar -xzf /tmp/ort.tgz -C /tmp/ort-extract
+            find /tmp/ort-extract -maxdepth 3 \( -type f -o -type l \) | head -50
+            DYLIB_PATH=""
+            if [ -e /tmp/ort-extract/lib/libonnxruntime.dylib ]; then
+              DYLIB_PATH=/tmp/ort-extract/lib/libonnxruntime.dylib
+            else
+              DYLIB_PATH=$(find /tmp/ort-extract -type f -name 'libonnxruntime.dylib' | head -1)
+            fi
+            [ -n "$DYLIB_PATH" ] || DYLIB_PATH=$(find /tmp/ort-extract -type f -name 'libonnxruntime*.dylib' | head -1)
+            [ -n "$DYLIB_PATH" ] || { echo "ERROR: 未找到 libonnxruntime*.dylib"; find /tmp/ort-extract \( -type f -o -type l \); exit 1; }
+            cp -L "$DYLIB_PATH" ort-test-dylib/libonnxruntime.dylib
+          else
+            curl -fL --retry 3 --retry-delay 2 -o ort-test-dylib/libonnxruntime.dylib "$DYLIB_URL"
+          fi
+          file ort-test-dylib/libonnxruntime.dylib
+          lipo -info ort-test-dylib/libonnxruntime.dylib
+          lipo -archs ort-test-dylib/libonnxruntime.dylib | grep -qw x86_64 \
+            || { echo "ERROR: 不是 x86_64"; exit 1; }
+          nm -gU ort-test-dylib/libonnxruntime.dylib | grep -q OrtGetApiBase \
+            || { echo "ERROR: 缺 OrtGetApiBase"; exit 1; }
+
+      - name: Download models
+        shell: bash
+        env:
+          U2NETP_URL: ${{ inputs.u2netp_url }}
+          BIREFNET_URL: ${{ inputs.birefnet_url }}
+          PPMATTING_URL: ${{ inputs.ppmatting_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p models
+          [ -n "$U2NETP_URL" ]  && curl -fL --retry 3 -o models/u2netp.onnx "$U2NETP_URL"
+          [ -n "$BIREFNET_URL" ] && curl -fL --retry 3 -o models/birefnet-lite-dynamic.onnx "$BIREFNET_URL"
+          [ -n "$PPMATTING_URL" ] && curl -fL --retry 3 -o models/ppmatting-hrnet-w18.onnx "$PPMATTING_URL"
+          ls -lh models/ || true
+          ls models/*.onnx >/dev/null 2>&1 || { echo "ERROR: 一个模型都没下载到"; exit 1; }
+
+      - name: Download test image
+        shell: bash
+        env:
+          URL: ${{ inputs.test_image_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p testdata
+          curl -fL --retry 3 -o testdata/input.jpg "$URL"
+          file testdata/input.jpg
+
+      - name: Build test binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path ort-test/Cargo.toml
+          TEST_BIN="ort-test/target/release/ort_dylib_test"
+          test -x "$TEST_BIN"
+          lipo -archs "$TEST_BIN" | grep -qw x86_64 || { echo "ERROR: 测试二进制不是 x86_64"; exit 1; }
+          echo "TEST_BIN=$TEST_BIN" >> $GITHUB_ENV
+
+      - name: Run test
+        shell: bash
+        env:
+          ORT_DYLIB_PATH: ${{ github.workspace }}/ort-test-dylib/libonnxruntime.dylib
+          TEST_IMAGE_PATH: ${{ github.workspace }}/testdata/input.jpg
+        run: |
+          set -euo pipefail
+          MODEL_ARGS=""
+          for m in u2netp.onnx birefnet-lite-dynamic.onnx ppmatting-hrnet-w18.onnx; do
+            [ -f "models/$m" ] && MODEL_ARGS="$MODEL_ARGS models/$m"
+          done
+          # shellcheck disable=SC2086
+          "$TEST_BIN" $MODEL_ARGS
+
+      - name: Upload x86_64 dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: dylib-x86_64
+          path: ort-test-dylib/libonnxruntime.dylib
+          if-no-files-found: error
+
+  # ── 3. 合并为 universal ───────────────────────────────────
+  merge:
+    needs: [test-arm64, test-intel]
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Download both slices
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Verify inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh artifacts/dylib-arm64/libonnxruntime.dylib
+          ls -lh artifacts/dylib-x86_64/libonnxruntime.dylib
+          lipo -archs artifacts/dylib-arm64/libonnxruntime.dylib | grep -qw arm64
+          lipo -archs artifacts/dylib-x86_64/libonnxruntime.dylib | grep -qw x86_64
+
+      - name: Merge with lipo
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p merged
+          lipo -create \
+            artifacts/dylib-arm64/libonnxruntime.dylib \
+            artifacts/dylib-x86_64/libonnxruntime.dylib \
+            -output merged/libonnxruntime.dylib
+          lipo -info merged/libonnxruntime.dylib
+          ARCHS=$(lipo -archs merged/libonnxruntime.dylib)
+          echo "Architectures: $ARCHS"
+          echo "$ARCHS" | grep -qw arm64  || { echo "ERROR: 缺 arm64 slice"; exit 1; }
+          echo "$ARCHS" | grep -qw x86_64 || { echo "ERROR: 缺 x86_64 slice"; exit 1; }
+          nm -gU merged/libonnxruntime.dylib | grep -q OrtGetApiBase \
+            || { echo "ERROR: 缺 OrtGetApiBase"; exit 1; }
+
+      - name: Upload universal dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: dylib-universal
+          path: merged/libonnxruntime.dylib
+          if-no-files-found: error
+
+  # ── 4. universal 双架构原生复验 ──────────────────────────
+  verify-universal:
+    needs: merge
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify runner arch
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner arch: $(uname -m), expected: ${{ matrix.arch }}"
+          test "$(uname -m)" = "${{ matrix.arch }}" || { echo "ERROR: runner 架构不匹配"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ort-test
+          key: ort-dylib-verify-${{ matrix.arch }}
+          cache-targets: true
+
+      - name: Add image dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo add image --manifest-path ort-test/Cargo.toml \
+            --no-default-features --features jpeg,png
+
+      - name: Download universal dylib
+        uses: actions/download-artifact@v4
+        with:
+          name: dylib-universal
+          path: ort-test-dylib
+
+      - name: Verify universal contains both slices
+        shell: bash
+        run: |
+          set -euo pipefail
+          lipo -info ort-test-dylib/libonnxruntime.dylib
+          ARCHS=$(lipo -archs ort-test-dylib/libonnxruntime.dylib)
+          echo "Architectures: $ARCHS"
+          echo "$ARCHS" | grep -qw arm64  || { echo "ERROR: 缺 arm64"; exit 1; }
+          echo "$ARCHS" | grep -qw x86_64 || { echo "ERROR: 缺 x86_64"; exit 1; }
+
+      - name: Download models
+        shell: bash
+        env:
+          U2NETP_URL: ${{ inputs.u2netp_url }}
+          BIREFNET_URL: ${{ inputs.birefnet_url }}
+          PPMATTING_URL: ${{ inputs.ppmatting_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p models
+          [ -n "$U2NETP_URL" ]  && curl -fL --retry 3 -o models/u2netp.onnx "$U2NETP_URL"
+          [ -n "$BIREFNET_URL" ] && curl -fL --retry 3 -o models/birefnet-lite-dynamic.onnx "$BIREFNET_URL"
+          [ -n "$PPMATTING_URL" ] && curl -fL --retry 3 -o models/ppmatting-hrnet-w18.onnx "$PPMATTING_URL"
+          ls -lh models/ || true
+          ls models/*.onnx >/dev/null 2>&1 || { echo "ERROR: 一个模型都没下载到"; exit 1; }
+
+      - name: Download test image
+        shell: bash
+        env:
+          URL: ${{ inputs.test_image_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p testdata
+          curl -fL --retry 3 -o testdata/input.jpg "$URL"
+          file testdata/input.jpg
+
+      - name: Build test binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path ort-test/Cargo.toml
+          TEST_BIN="ort-test/target/release/ort_dylib_test"
+          test -x "$TEST_BIN"
+          lipo -archs "$TEST_BIN" | grep -qw "${{ matrix.arch }}" \
+            || { echo "ERROR: 测试二进制不是 ${{ matrix.arch }}"; exit 1; }
+          echo "TEST_BIN=$TEST_BIN" >> $GITHUB_ENV
+
+      - name: Run test against universal dylib
+        shell: bash
+        env:
+          ORT_DYLIB_PATH: ${{ github.workspace }}/ort-test-dylib/libonnxruntime.dylib
+          TEST_IMAGE_PATH: ${{ github.workspace }}/testdata/input.jpg
+        run: |
+          set -euo pipefail
+          MODEL_ARGS=""
+          for m in u2netp.onnx birefnet-lite-dynamic.onnx ppmatting-hrnet-w18.onnx; do
+            [ -f "models/$m" ] && MODEL_ARGS="$MODEL_ARGS models/$m"
+          done
+          echo "验证 universal 在 ${{ matrix.arch }} 上的行为"
+          # shellcheck disable=SC2086
+          "$TEST_BIN" $MODEL_ARGS
+
+  # ── 5. 发布三个 dylib ─────────────────────────────────────
+  release:
+    needs: verify-universal
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.release_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="deps-ort-universal-${GITHUB_RUN_ID}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Resolved release tag: $TAG"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp artifacts/dylib-arm64/libonnxruntime.dylib      release/libonnxruntime-arm64.dylib
+          cp artifacts/dylib-x86_64/libonnxruntime.dylib     release/libonnxruntime-x86_64.dylib
+          cp artifacts/dylib-universal/libonnxruntime.dylib  release/libonnxruntime-universal.dylib
+          ls -lh release/
+          echo "--- arm64 ---"
+          lipo -archs release/libonnxruntime-arm64.dylib
+          echo "--- x86_64 ---"
+          lipo -archs release/libonnxruntime-x86_64.dylib
+          echo "--- universal ---"
+          lipo -archs release/libonnxruntime-universal.dylib
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          body: |
+            ONNX Runtime dylib 构建产物（包含 DeformConv 支持的切片）。
+
+            **三个文件：**
+            - `libonnxruntime-arm64.dylib`：Apple Silicon 原生切片
+            - `libonnxruntime-x86_64.dylib`：Intel 原生切片（基于 PR 编译）
+            - `libonnxruntime-universal.dylib`：universal 二进制，dyld 会按进程架构自动选择对应 slice
+
+            **验证流程：**
+            1. arm64 切片在 `macos-15` 原生 runner 上加载 + 推理通过
+            2. x86_64 切片在 `macos-15-intel` 原生 runner 上加载 + 推理通过
+            3. `lipo -create` 合并为 universal
+            4. universal 在 `macos-15` 和 `macos-15-intel` 上分别原生复验通过
+          files: |
+            release/libonnxruntime-arm64.dylib
+            release/libonnxruntime-x86_64.dylib
+            release/libonnxruntime-universal.dylib
+          fail_on_unmatched_files: true
+          make_latest: false
