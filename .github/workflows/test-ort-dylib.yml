@@ -1,31 +1,27 @@
 name: test-ort-dylib
 
-# 验证任意来源的 libonnxruntime.dylib 是否能加载并推理。
-# 典型用途：验证从 PR #27393 源码编译出的 x86_64 dylib。
-#
-# 模型 URL 需公开可访问（curl 直接拉），因为主项目是私有仓，
-# 无法通过 actions/cache 跨仓共享模型。建议把模型文件放到
-# PrivBgCut-Deps 公开仓的 Release 里，用它的 asset URL。
+# 独立验证任意来源的 libonnxruntime.dylib 是否能加载并推理。
+# 完全自包含：不依赖主仓 PrivBgCut，模型通过 URL 直接下载。
 on:
   workflow_dispatch:
     inputs:
-      dylib_url: 
+      dylib_url:
         description: 'libonnxruntime.dylib 下载 URL'
         type: string
         required: true
         default: "https://github.com/James-boy/PrivBgCut-Deps/releases/download/deps-ort-v1.23.2/libonnxruntime-1.23.2-x86_64.dylib"
       u2netp_url:
-        description: '（可选）u2netp.onnx 下载 URL，留空则跳过'
+        description: '（可选）u2netp.onnx URL'
         type: string
         required: false
         default: ''
-      birefnet_url: 
-        description: '（可选）birefnet-lite-dynamic.onnx 下载 URL，留空则跳过'
+      birefnet_url:
+        description: '（可选）birefnet-lite-dynamic.onnx URL'
         type: string
         required: false
         default: 'https://hf-mirror.com/senty-au/BiRefNet_lite-ONNX-dynamic/resolve/main/onnx/model.onnx?download=true'
       ppmatting_url:
-        description: '（可选）ppmatting-hrnet-w18.onnx 下载 URL，留空则跳过'
+        description: '（可选）ppmatting-hrnet-w18.onnx URL'
         type: string
         required: false
         default: ''
@@ -36,8 +32,6 @@ concurrency:
 
 jobs:
   test:
-    # 用 Intel runner，直接原生运行 x86_64 dylib，
-    # 避免 Rosetta 引入额外变量。
     runs-on: macos-15-intel
     timeout-minutes: 40
 
@@ -48,16 +42,14 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # Rust 编译缓存（同仓内有效，跟模型缓存无关）
-      # 如果连这个也不想用，把这一步删掉即可，只是每次编译会变慢。
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
-          key: dylib-test
+          workspaces: ort-test
+          key: ort-dylib-test
           cache-targets: true
 
-      # ── 下载模型（按需，留空的跳过）─────────────────────
+      # ── 下载模型 ────────────────────────────────────────────
       - name: Download u2netp
         if: inputs.u2netp_url != ''
         shell: bash
@@ -118,32 +110,29 @@ jobs:
           DYLIB_URL: ${{ inputs.dylib_url }}
         run: |
           set -euo pipefail
-          mkdir -p ort-test
+          mkdir -p ort-test-dylib
           curl -fL --retry 3 --retry-delay 2 \
-            -o ort-test/libonnxruntime.dylib \
+            -o ort-test-dylib/libonnxruntime.dylib \
             "$DYLIB_URL"
-          ls -lh ort-test/libonnxruntime.dylib
+          ls -lh ort-test-dylib/libonnxruntime.dylib
           echo "--- architecture ---"
-          lipo -info ort-test/libonnxruntime.dylib
-          ARCHS=$(lipo -archs ort-test/libonnxruntime.dylib)
+          lipo -info ort-test-dylib/libonnxruntime.dylib
+          ARCHS=$(lipo -archs ort-test-dylib/libonnxruntime.dylib)
           echo "Architectures: $ARCHS"
           echo "$ARCHS" | grep -qw x86_64 \
             || { echo "ERROR: dylib 不含 x86_64 slice"; exit 1; }
-          # 检查 OrtGetApiBase 符号（dlopen 成功的必要条件）
-          nm -gU ort-test/libonnxruntime.dylib | grep -q OrtGetApiBase \
+          nm -gU ort-test-dylib/libonnxruntime.dylib | grep -q OrtGetApiBase \
             || { echo "ERROR: 缺少 OrtGetApiBase 符号"; exit 1; }
           echo "OK: OrtGetApiBase present"
 
-      # ── 编译测试二进制 ─────────────────────────────────────
+      # ── 编译测试二进制（独立 crate，不依赖主仓）────────────
       - name: Build test binary
         shell: bash
         run: |
           set -euo pipefail
           cargo build --release \
-            --manifest-path src-tauri/Cargo.toml \
-            --features dylib-test \
-            --bin ort_dylib_test
-          TEST_BIN="src-tauri/target/release/ort_dylib_test"
+            --manifest-path ort-test/Cargo.toml
+          TEST_BIN="ort-test/target/release/ort_dylib_test"
           test -x "$TEST_BIN" || { echo "ERROR: 测试二进制缺失"; exit 1; }
           echo "TEST_BIN=$TEST_BIN" >> $GITHUB_ENV
 
@@ -151,10 +140,9 @@ jobs:
       - name: Run dylib + model inference test
         shell: bash
         env:
-          ORT_DYLIB_PATH: ${{ github.workspace }}/ort-test/libonnxruntime.dylib
+          ORT_DYLIB_PATH: ${{ github.workspace }}/ort-test-dylib/libonnxruntime.dylib
         run: |
           set -euo pipefail
-          # 收集所有实际存在的模型
           MODEL_ARGS=""
           for m in u2netp.onnx birefnet-lite-dynamic.onnx ppmatting-hrnet-w18.onnx; do
             if [ -f "models/$m" ]; then
