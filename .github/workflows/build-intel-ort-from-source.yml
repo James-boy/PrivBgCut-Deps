@@ -1,4 +1,4 @@
-name: build-ort-from-source
+name: build-intel-ort-from-source
 
 on:
   workflow_dispatch:
