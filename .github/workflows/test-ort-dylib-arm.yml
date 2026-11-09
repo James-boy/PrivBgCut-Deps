@@ -82,13 +82,38 @@ jobs:
           if [[ "$DYLIB_URL" == *.tgz ]] || [[ "$DYLIB_URL" == *.tar.gz ]]; then
             echo "Detected tarball, downloading and extracting..."
             curl -fL --retry 3 --retry-delay 2 -o /tmp/ort.tgz "$DYLIB_URL"
-            tar -xzf /tmp/ort.tgz -C /tmp
-            DYLIB_PATH=$(find /tmp -name 'libonnxruntime.dylib' -type f | head -1)
-            test -n "$DYLIB_PATH" || { echo "ERROR: tgz 中未找到 libonnxruntime.dylib"; exit 1; }
-            cp "$DYLIB_PATH" ort-test-dylib/libonnxruntime.dylib
+            rm -rf /tmp/ort-extract
+            mkdir -p /tmp/ort-extract
+            tar -xzf /tmp/ort.tgz -C /tmp/ort-extract
+
+            echo "--- extracted tree (top 3 levels) ---"
+            find /tmp/ort-extract -maxdepth 3 \( -type f -o -type l \) | head -50
+
+            # 优先匹配不带版本号的 libonnxruntime.dylib，其次匹配带版本号的
+            DYLIB_PATH=""
+            if [ -e /tmp/ort-extract/lib/libonnxruntime.dylib ]; then
+              DYLIB_PATH=/tmp/ort-extract/lib/libonnxruntime.dylib
+            else
+              DYLIB_PATH=$(find /tmp/ort-extract -type f -name 'libonnxruntime.dylib' | head -1)
+            fi
+            if [ -z "$DYLIB_PATH" ]; then
+              DYLIB_PATH=$(find /tmp/ort-extract -type f -name 'libonnxruntime*.dylib' | head -1)
+            fi
+            if [ -z "$DYLIB_PATH" ]; then
+              echo "ERROR: 解压目录中未找到 libonnxruntime*.dylib"
+              echo "实际文件列表："
+              find /tmp/ort-extract \( -type f -o -type l \) | head -100
+              exit 1
+            fi
+            echo "Selected dylib: $DYLIB_PATH"
+            ls -lh "$DYLIB_PATH"
+
+            # -L 跟随 symlink，确保复制的是真实 Mach-O 文件
+            cp -L "$DYLIB_PATH" ort-test-dylib/libonnxruntime.dylib
           else
             curl -fL --retry 3 --retry-delay 2 -o ort-test-dylib/libonnxruntime.dylib "$DYLIB_URL"
           fi
+
           ls -lh ort-test-dylib/libonnxruntime.dylib
           file ort-test-dylib/libonnxruntime.dylib
           lipo -info ort-test-dylib/libonnxruntime.dylib
